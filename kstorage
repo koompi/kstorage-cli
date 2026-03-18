@@ -1,0 +1,997 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${KSTORAGE_BASE_URL:-https://api-kconsole.koompi.cloud}"
+CONFIG_DIR="${HOME}/.config/kstorage"
+CONFIG_FILE="${CONFIG_DIR}/config"
+
+mkdir -p "$CONFIG_DIR"
+
+check_tools() {
+    local missing=()
+    for tool in "$@"; do
+        if ! command -v "$tool" &>/dev/null; then
+            missing+=("$tool")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Missing required tools: ${missing[*]}"
+        echo ""
+        echo "Install them:"
+        for tool in "${missing[@]}"; do
+            case "$tool" in
+                mongodump)       echo "  mongodump:   sudo apt install mongodb-database-tools" ;;
+                mongorestore)    echo "  mongorestore: sudo apt install mongodb-database-tools" ;;
+                pg_dump)         echo "  pg_dump:      sudo apt install postgresql-client" ;;
+                psql)            echo "  psql:         sudo apt install postgresql-client" ;;
+                mysqldump)       echo "  mysqldump:    sudo apt install mysql-client" ;;
+                mysql)           echo "  mysql:        sudo apt install mysql-client" ;;
+                curl)            echo "  curl:         sudo apt install curl" ;;
+                jq)              echo "  jq:           sudo apt install jq" ;;
+                file)            echo "  file:         sudo apt install file" ;;
+                fzf)             echo "  fzf:          sudo apt install fzf (optional)" ;;
+                *)               echo "  ${tool}:       (check your package manager)" ;;
+            esac
+        done
+        exit 1
+    fi
+}
+
+check_tools curl jq file
+
+usage() {
+    cat <<'EOF'
+Usage: kstorage [command] [args]
+
+Commands:
+  auth <api-key>              Save API key for reuse
+  upload [--public] <file>    Upload file (default: private)
+  list [options] [query]      List objects with filters
+  db backup <name>            Backup a database and upload
+  db restore <name>           Restore a database from backup
+  url <filename|objectId>     Get temporary access URL for a private file
+  delete <filename|objectId>  Delete a file
+  show-key                    Show current saved API key
+
+Database types: --mongo, --postgres, --mysql, --mariadb
+
+DB backup:
+  kstorage db backup stadiumx --mongo --uri 'mongodb://...'
+  kstorage db backup weteka --postgres --uri 'postgresql://...'
+  kstorage db backup myapp --mongo              # will prompt for --uri
+
+  Options:
+    --uri <connection-uri>       Connection string (prompted if omitted)
+    --db <database>              Database name (if not in URI)
+    --keep <N>                   Keep last N backups (default: 7)
+    --public                     Upload as public (default: private)
+    --dry-run                    Show what would happen
+
+DB restore:
+  kstorage db restore stadiumx --mongo
+  kstorage db restore stadiumx --mongo --drop    # clean restore (recommended)
+  kstorage db restore weteka --postgres --uri 'postgresql://...'
+
+  Options:
+    --drop                       Drop existing data before restoring (clean restore)
+    --uri <connection-uri>       Target connection string (prompted if omitted)
+
+List options:
+  --all                       Fetch all pages (default: first 100)
+  --public / --private        Filter by visibility
+  --match <regex>             Filter by regex on filename
+  --ext <ext>                 Filter by extension (e.g. gz, pdf)
+  --json                      Output raw JSON
+
+Environment:
+  KSTORAGE_BASE_URL           Override API base URL
+EOF
+    exit 1
+}
+
+load_key() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        API_KEY=$(grep '^key=' "$CONFIG_FILE" | cut -d= -f2-)
+    fi
+    if [[ -z "${API_KEY:-}" ]]; then
+        echo "Error: No API key set. Run: kstorage auth <api-key>"
+        exit 1
+    fi
+}
+
+save_key() {
+    echo "key=${1}" > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    echo "API key saved."
+}
+
+api_get() {
+    curl -s "$1" -H "x-api-key: ${API_KEY}"
+}
+
+api_post() {
+    curl -s -X POST "$1" -H "x-api-key: ${API_KEY}" -H "Content-Type: application/json" -d "$2"
+}
+
+api_delete() {
+    curl -s -X DELETE "$1" -H "x-api-key: ${API_KEY}"
+}
+
+resolve_name_or_id() {
+    local input="$1"
+    if [[ "$input" =~ ^[0-9a-fA-F]{24}$ ]]; then
+        echo "$input"
+        return
+    fi
+    local resp match
+    resp=$(api_get "${BASE_URL}/api/storage/objects?search=${input}&limit=100")
+    match=$(echo "$resp" | jq -r "[.data.objects // .data.docs // [] | .[] | select(.filename == \"${input}\")] | .[-1]._id // .[-1].id // empty")
+    if [[ -z "$match" ]]; then
+        echo "Error: No file found matching '${input}'" >&2
+        exit 1
+    fi
+    echo "$match"
+}
+
+find_existing() {
+    local resp
+    resp=$(api_get "${BASE_URL}/api/storage/objects?search=${1}&limit=100")
+    echo "$resp" | jq -r "[.data.objects // .data.docs // [] | .[] | select(.filename == \"${1}\")] | .[-1]._id // .[-1].id // empty"
+}
+
+get_filename_without_ext() {
+    local ext="${1##*.}"
+    if [[ "$ext" == "$1" ]]; then echo "$1"; else echo "${1%.*}"; fi
+}
+
+get_extension() {
+    local ext="${1##*.}"
+    if [[ "$ext" == "$1" ]]; then echo ""; else echo ".${ext}"; fi
+}
+
+prompt_uri() {
+    local val
+    read -rp "${1} URI (${2}): " val
+    if [[ -z "$val" ]]; then
+        echo "Error: URI is required." >&2
+        exit 1
+    fi
+    echo "$val"
+}
+
+get_db_ext() {
+    case "$1" in
+        mongo)    echo "mongo.gz" ;;
+        postgres) echo "postgres.gz" ;;
+        mysql)    echo "mysql.gz" ;;
+        mariadb)  echo "mariadb.gz" ;;
+        *)        echo "gz" ;;
+    esac
+}
+
+upload_file() {
+    local filepath="$1" filename="$2" visibility="$3"
+    local size content_type token_resp upload_url object_id
+
+    size=$(stat -c%s "$filepath")
+    content_type="application/gzip"
+
+    token_resp=$(api_post "${BASE_URL}/api/storage/upload-token" \
+        "{\"filename\":\"${filename}\",\"contentType\":\"${content_type}\",\"size\":${size},\"visibility\":\"${visibility}\"}")
+
+    upload_url=$(echo "$token_resp" | jq -r '.data.uploadUrl')
+    object_id=$(echo "$token_resp" | jq -r '.data.objectId')
+
+    if [[ "$upload_url" == "null" || -z "$upload_url" ]]; then
+        echo "Error: Failed to get upload token"
+        echo "$token_resp" | jq . 2>/dev/null || echo "$token_resp"
+        return 1
+    fi
+
+    echo "  Uploading ${filename} (${size} bytes)..." >&2
+
+    local upload_resp http_code
+    upload_resp=$(curl -s -w "\n%{http_code}" -X PUT "$upload_url" \
+        -H "Content-Type: ${content_type}" \
+        --data-binary @"${filepath}")
+    http_code=$(echo "$upload_resp" | tail -1)
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        local confirm_resp confirm_ok
+        confirm_resp=$(api_post "${BASE_URL}/api/storage/complete" "{\"objectId\":\"${object_id}\"}")
+        confirm_ok=$(echo "$confirm_resp" | jq -r '.success')
+        if [[ "$confirm_ok" != "true" ]]; then
+            echo "Warning: Upload confirm failed." >&2
+            echo "$confirm_resp" | jq . 2>/dev/null || echo "$confirm_resp" >&2
+        fi
+    else
+        echo "Error: Upload failed (HTTP ${http_code})"
+        return 1
+    fi
+
+    echo "$object_id"
+    return 0
+}
+
+# ── Database helpers ──────────────────────────────────────────────
+
+do_backup_mongo() {
+    local uri="$1" db="$2" out_dir="$3"
+    local cmd=(mongodump --uri "$uri" --out "$out_dir")
+    [[ -n "$db" ]] && cmd+=(--db "$db")
+    "${cmd[@]}" 2>&1
+}
+
+do_restore_mongo() {
+    local uri="$1" db="$2" archive="$3" drop="${4:-false}"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    tar xzf "$archive" -C "$tmp_dir"
+    # Find the actual dump directory inside the extracted archive
+    local dump_dir
+    dump_dir=$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
+    [[ -z "$dump_dir" ]] && dump_dir="$tmp_dir"
+    local cmd=(mongorestore --uri "$uri")
+    [[ "$drop" == "true" ]] && cmd+=(--drop)
+    [[ -n "$db" ]] && cmd+=(--db "$db")
+    cmd+=("$dump_dir/")
+    "${cmd[@]}" 2>&1
+    rm -rf "$tmp_dir"
+}
+
+do_backup_postgres() {
+    local uri="$1" db="$2" out_file="$3"
+    local cmd=(pg_dump "$uri")
+    [[ -n "$db" ]] && cmd+=("$db")
+    "${cmd[@]}" 2>&1 | gzip > "$out_file"
+}
+
+do_restore_postgres() {
+    local uri="$1" db="$2" archive="$3" drop="${4:-false}"
+    if [[ "$drop" == "true" ]]; then
+        # Use --clean in pg_dump would add DROP statements, but since we have an existing dump,
+        # we drop and recreate the database before restoring
+        local db_name
+        db_name=$(echo "$uri" | grep -oP '/\K[^/?]+$' || true)
+        if [[ -n "$db_name" ]]; then
+            local base_uri
+            base_uri=$(echo "$uri" | sed "s|/${db_name}.*|/postgres|")
+            echo "  Dropping and recreating database '${db_name}'..."
+            psql "$base_uri" -c "DROP DATABASE IF EXISTS \"${db_name}\";" 2>&1
+            psql "$base_uri" -c "CREATE DATABASE \"${db_name}\";" 2>&1
+        fi
+    fi
+    gunzip -c "$archive" | psql "$uri" 2>&1
+}
+
+do_backup_mysql() {
+    local uri="$1" db="$2" out_file="$3"
+    local cmd=(mysqldump "$uri")
+    [[ -n "$db" ]] && cmd+=("$db")
+    "${cmd[@]}" 2>&1 | gzip > "$out_file"
+}
+
+do_restore_mysql() {
+    local uri="$1" db="$2" archive="$3" drop="${4:-false}"
+    if [[ "$drop" == "true" ]]; then
+        # Prepend SET FOREIGN_KEY_CHECKS=0 and let the dump's DROP TABLE statements work
+        (echo "SET FOREIGN_KEY_CHECKS=0;"; gunzip -c "$archive") | mysql "$uri" 2>&1
+    else
+        gunzip -c "$archive" | mysql "$uri" 2>&1
+    fi
+}
+
+do_backup_mariadb() {
+    do_backup_mysql "$@"
+}
+
+do_restore_mariadb() {
+    do_restore_mysql "$@"
+}
+
+# ── DB Backup ─────────────────────────────────────────────────────
+
+do_db_backup() {
+    local db_type="" name="" uri="" db_name="" keep=7 visibility="private" dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mongo)    db_type="mongo"; shift ;;
+            --postgres) db_type="postgres"; shift ;;
+            --mysql)    db_type="mysql"; shift ;;
+            --mariadb)  db_type="mariadb"; shift ;;
+            --uri)      uri="$2"; shift 2 ;;
+            --db)       db_name="$2"; shift 2 ;;
+            --keep)     keep="$2"; shift 2 ;;
+            --public)   visibility="public"; shift ;;
+            --dry-run)  dry_run=true; shift ;;
+            -*)         echo "Unknown option: $1"; exit 1 ;;
+            *)          name="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$db_type" ]] && { echo "Error: Database type required (--mongo, --postgres, --mysql, --mariadb)."; exit 1; }
+
+    local required_tools=(curl jq)
+    case "$db_type" in
+        mongo)         required_tools+=(mongodump) ;;
+        postgres)      required_tools+=(pg_dump) ;;
+        mysql|mariadb) required_tools+=(mysqldump) ;;
+    esac
+    check_tools "${required_tools[@]}"
+
+    [[ -z "$name" ]] && { echo "Error: Backup name is required."; exit 1; }
+
+    local example_uri
+    case "$db_type" in
+        mongo)    example_uri="mongodb://user:pass@host:27017" ;;
+        postgres) example_uri="postgresql://user:pass@host:5432" ;;
+        mysql)    example_uri="mysql://user:pass@host:3306" ;;
+        mariadb)  example_uri="mariadb://user:pass@host:3306" ;;
+    esac
+
+    if [[ -z "$uri" ]]; then
+        if [[ ! -t 0 ]]; then
+            echo "Error: --uri is required when running non-interactively (e.g. from cron)."
+            exit 1
+        fi
+        uri=$(prompt_uri "$db_type" "$example_uri")
+    fi
+
+    load_key
+
+    local timestamp ext archive_name work_dir
+    timestamp=$(date +%Y-%m-%d_%H%M%S)
+    ext=$(get_db_ext "$db_type")
+    archive_name="${name}-db-${timestamp}.${ext}"
+    work_dir="/tmp/kstorage-backup-${name}-${timestamp}"
+
+    echo "=== DB Backup: ${name} (${db_type}) ==="
+    echo "  archive:    ${archive_name}"
+    echo "  keep:       last ${keep}"
+    echo "  visibility: ${visibility}"
+
+    if $dry_run; then
+        echo ""
+        echo "[DRY RUN] Would run backup then upload."
+        return
+    fi
+
+    echo ""
+    echo "[1/3] Dumping database..."
+    mkdir -p "$work_dir"
+
+    case "$db_type" in
+        mongo)
+            do_backup_mongo "$uri" "$db_name" "$work_dir"
+            echo "  Compressing..."
+            tar czf "/tmp/kstorage-tmp-${timestamp}.tar.gz" -C /tmp "$(basename "$work_dir")" 2>/dev/null
+            rm -rf "$work_dir"
+            mkdir -p "$work_dir"
+            mv "/tmp/kstorage-tmp-${timestamp}.tar.gz" "${work_dir}/archive.gz"
+            ;;
+        postgres|mysql|mariadb)
+            "do_backup_${db_type}" "$uri" "$db_name" "${work_dir}/archive.gz"
+            ;;
+    esac
+
+    echo "[2/3] Uploading to kstorage..."
+
+    local object_id upload_ok
+    object_id=$(upload_file "${work_dir}/archive.gz" "$archive_name" "$visibility") || upload_ok=$?
+    rm -rf "$work_dir"
+
+    if [[ "${upload_ok:-0}" -ne 0 ]]; then
+        echo "Error: Upload failed."
+        exit 1
+    fi
+
+    echo "[3/3] Cleaning up old backups (keeping last ${keep})..."
+
+    local all_backups backup_ids bname bid
+    all_backups=$(api_get "${BASE_URL}/api/storage/objects?search=${name}-db-&limit=100")
+    backup_ids=$(echo "$all_backups" | jq -r "
+        [.data.objects // .data.docs // [] |
+        .[] |
+        select(.filename | test(\"^${name}-db-.*\\\\.${ext}$\"))] |
+        sort_by(.createdAt) |
+        .[:-${keep}] |
+        .[]._id // .id // empty
+    " 2>/dev/null || true)
+
+    if [[ -n "$backup_ids" ]]; then
+        while IFS= read -r bid; do
+            [[ -z "$bid" ]] && continue
+            bname=$(echo "$all_backups" | jq -r "[.data.objects // .data.docs // [] | .[] | select(._id == \"${bid}\" or .id == \"${bid}\")] | .[0].filename // \"?\"")
+            echo "  Deleting old backup: ${bname}"
+            api_delete "${BASE_URL}/api/storage/objects/${bid}" > /dev/null
+        done <<< "$backup_ids"
+    else
+        echo "  No old backups to clean."
+    fi
+
+    echo ""
+    echo "Backup complete."
+    echo "  filename: ${archive_name}"
+    echo "  objectId: ${object_id}"
+
+    # Skip interactive cron setup when running non-interactively (e.g. from cron)
+    if [[ ! -t 0 ]]; then
+        return
+    fi
+
+    echo ""
+    echo "Schedule automatic backups?"
+    echo "  [1] Every night"
+    echo "  [2] Twice a day (every 12 hours)"
+    echo "  [3] Every 6 hours"
+    echo "  [4] Every week (Sunday)"
+    echo "  [5] Weekdays only (Mon-Fri)"
+    echo "  [6] Custom cron expression"
+    echo "  [7] Skip"
+    read -rp "Choice [1-7]: " cron_choice
+
+    local cron_expr="" schedule_label=""
+    case "$cron_choice" in
+        1) schedule_label="every night" ;;
+        2) schedule_label="twice a day" ;;
+        3)
+            cron_expr="0 */6 * * *"
+            schedule_label="every 6 hours"
+            ;;
+        4) schedule_label="every Sunday" ;;
+        5) schedule_label="weekdays (Mon-Fri)" ;;
+        6)
+            echo ""
+            echo "Enter cron expression (min hour day month weekday):"
+            echo "  Examples:  0 3 * * *   = daily 3 AM"
+            echo "             0 */4 * * * = every 4 hours"
+            echo "             0 0 1 * *   = 1st of every month"
+            read -rp "Cron: " cron_expr
+            schedule_label="custom"
+            ;;
+        *)
+            echo "Skipped."
+            return
+            ;;
+    esac
+
+    # For options that need a time, ask the user to pick one
+    if [[ -z "$cron_expr" ]]; then
+        echo ""
+        echo "What time?"
+        echo "  [1]  12:00 AM (midnight)"
+        echo "  [2]   1:00 AM"
+        echo "  [3]   2:00 AM (recommended)"
+        echo "  [4]   3:00 AM"
+        echo "  [5]   4:00 AM"
+        echo "  [6]   5:00 AM"
+        echo "  [7]   6:00 AM"
+        echo "  [8]  12:00 PM (noon)"
+        echo "  [9]   6:00 PM"
+        echo "  [10]  9:00 PM"
+        read -rp "Choice [1-10] (default: 3): " time_choice
+
+        local hour=2
+        case "${time_choice:-3}" in
+            1)  hour=0  ;;
+            2)  hour=1  ;;
+            3)  hour=2  ;;
+            4)  hour=3  ;;
+            5)  hour=4  ;;
+            6)  hour=5  ;;
+            7)  hour=6  ;;
+            8)  hour=12 ;;
+            9)  hour=18 ;;
+            10) hour=21 ;;
+            *)  hour=2  ;;
+        esac
+
+        case "$cron_choice" in
+            1) cron_expr="0 ${hour} * * *" ;;             # every night at chosen hour
+            2) cron_expr="0 ${hour},$(( (hour + 12) % 24 )) * * *" ;;  # twice a day
+            4) cron_expr="0 ${hour} * * 0" ;;             # every Sunday
+            5) cron_expr="0 ${hour} * * 1-5" ;;           # weekdays only
+        esac
+
+        # Format the hour for display
+        local display_hour
+        if [[ $hour -eq 0 ]]; then
+            display_hour="12:00 AM"
+        elif [[ $hour -lt 12 ]]; then
+            display_hour="${hour}:00 AM"
+        elif [[ $hour -eq 12 ]]; then
+            display_hour="12:00 PM"
+        else
+            display_hour="$(( hour - 12 )):00 PM"
+        fi
+        schedule_label="${schedule_label} at ${display_hour}"
+    fi
+
+    [[ -z "$cron_expr" ]] && { echo "Skipped."; return; }
+
+    echo ""
+    echo "Schedule: ${schedule_label} (${cron_expr})"
+
+    local script_path cron_cmd
+    script_path=$(readlink -f "$0")
+    cron_cmd="${cron_expr} PATH=/usr/local/bin:/usr/bin:/bin ${script_path} db backup ${name} --${db_type} --uri '${uri}'"
+    [[ -n "$db_name" ]] && cron_cmd="${cron_cmd} --db '${db_name}'"
+    cron_cmd="${cron_cmd} --keep ${keep}"
+
+    echo ""
+    echo "Cron job to add:"
+    echo "  ${cron_cmd}"
+    echo ""
+    echo "Install to:"
+    echo "  [1] Current user crontab ($(whoami)) — recommended"
+    echo "  [2] System-wide /etc/cron.d/ (requires sudo)"
+    echo "  [3] Cancel"
+    read -rp "Choice [1/2/3] (default: 1): " install_choice
+    case "${install_choice:-1}" in
+        2)
+            echo "Installing cron job (sudo)..."
+            echo "${cron_cmd}" | sudo tee /etc/cron.d/kstorage-backup-${name} > /dev/null
+            sudo chmod 644 "/etc/cron.d/kstorage-backup-${name}"
+            echo "Installed to /etc/cron.d/kstorage-backup-${name}"
+            ;;
+        3)
+            echo "Cancelled. You can add it manually:"
+            echo "  crontab -e"
+            echo "  # then paste: ${cron_cmd}"
+            return
+            ;;
+        *)
+            echo "Installing cron job for $(whoami)..."
+            # Remove any existing kstorage cron for this backup name, then add the new one
+            # Use "|| true" because crontab -l fails with exit 1 when no crontab exists,
+            # and set -e would kill the subshell before the echo runs
+            local existing_crontab
+            existing_crontab=$(crontab -l 2>/dev/null || true)
+            if echo "$existing_crontab" | grep -q "# kstorage:${name}$"; then
+                echo "  Replacing existing cron job for '${name}'..."
+                existing_crontab=$(echo "$existing_crontab" | grep -v "# kstorage:${name}$")
+            fi
+            { echo "$existing_crontab"; echo "${cron_cmd} # kstorage:${name}"; } | crontab -
+            echo "Added to crontab for $(whoami). View with: crontab -l"
+            ;;
+    esac
+
+    echo "Done! Backups will run automatically."
+
+    echo ""
+    read -rp "Run a test backup now to verify? [y/N]: " test_choice
+    case "$test_choice" in
+        y|Y)
+            echo ""
+            echo "=== Testing cron backup (non-interactive) ==="
+            echo ""
+            # Build the same command the cron would run, without the cron schedule prefix
+            local test_cmd="${script_path} db backup ${name} --${db_type} --uri '${uri}'"
+            [[ -n "$db_name" ]] && test_cmd="${test_cmd} --db '${db_name}'"
+            test_cmd="${test_cmd} --keep ${keep}"
+            # Run with stdin from /dev/null to simulate cron (no TTY)
+            if eval "$test_cmd" < /dev/null; then
+                echo ""
+                echo "✅ Test backup succeeded! Cron job is good to go."
+            else
+                echo ""
+                echo "❌ Test backup failed. Check the errors above and fix before relying on cron."
+            fi
+            ;;
+        *)
+            echo ""
+            echo "Tip: You can test manually anytime with:"
+            echo "  ${script_path} db backup ${name} --${db_type} --uri '...' --keep ${keep}"
+            ;;
+    esac
+}
+
+# ── DB Restore ────────────────────────────────────────────────────
+
+do_db_restore() {
+    local db_type="" name="" uri="" drop_mode=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mongo)    db_type="mongo"; shift ;;
+            --postgres) db_type="postgres"; shift ;;
+            --mysql)    db_type="mysql"; shift ;;
+            --mariadb)  db_type="mariadb"; shift ;;
+            --uri)      uri="$2"; shift 2 ;;
+            --drop)     drop_mode="true"; shift ;;
+            -*)         echo "Unknown option: $1"; exit 1 ;;
+            *)          name="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$db_type" ]] && { echo "Error: Database type required (--mongo, --postgres, --mysql, --mariadb)."; exit 1; }
+
+    local required_tools=(curl jq)
+    case "$db_type" in
+        mongo)         required_tools+=(mongorestore) ;;
+        postgres)      required_tools+=(psql) ;;
+        mysql|mariadb) required_tools+=(mysql) ;;
+    esac
+    check_tools "${required_tools[@]}"
+
+    [[ -z "$name" ]] && { echo "Error: Backup name is required."; exit 1; }
+
+    load_key
+
+    local ext
+    ext=$(get_db_ext "$db_type")
+
+    echo "=== DB Restore: ${name} (${db_type}) ==="
+    echo ""
+    echo "Fetching backups..."
+
+    local all_backups backups_json
+    all_backups=$(api_get "${BASE_URL}/api/storage/objects?search=${name}-db-&limit=100")
+    backups_json=$(echo "$all_backups" | jq -r "
+        [.data.objects // .data.docs // [] |
+        .[] |
+        select(.filename | test(\"^${name}-db-.*\\\\.${ext}$\"))] |
+        sort_by(.createdAt) |
+        reverse |
+        .[] |
+        \"\(.filename)|\(.size)|\(._id // .id)\"
+    ")
+
+    if [[ -z "$backups_json" ]]; then
+        echo "No backups found for '${name}' (${db_type})."
+        exit 1
+    fi
+
+    local selected
+    if command -v fzf &>/dev/null; then
+        selected=$(echo "$backups_json" | fzf --header="Select backup to restore" --prompt="> " \
+            --delimiter='|' \
+            --with-nth=1,2)
+    else
+        echo "Available backups:"
+        local i=1 fname fsize fid
+        while IFS= read -r line; do
+            fname=$(echo "$line" | cut -d'|' -f1)
+            fsize=$(echo "$line" | cut -d'|' -f2)
+            fid=$(echo "$line" | cut -d'|' -f3)
+            echo "  [$i] ${fname}  (${fsize}B)  ${fid}"
+            i=$((i + 1))
+        done <<< "$backups_json"
+        echo ""
+        read -rp "Select backup number: " choice
+        selected=$(echo "$backups_json" | sed -n "${choice}p")
+    fi
+
+    [[ -z "$selected" ]] && { echo "Cancelled."; exit 0; }
+
+    local backup_filename backup_object_id
+    backup_filename=$(echo "$selected" | cut -d'|' -f1)
+    backup_object_id=$(echo "$selected" | cut -d'|' -f3)
+
+    echo "Selected: ${backup_filename}"
+
+    local example_uri
+    case "$db_type" in
+        mongo)    example_uri="mongodb://localhost:27017" ;;
+        postgres) example_uri="postgresql://localhost:5432" ;;
+        mysql)    example_uri="mysql://localhost:3306" ;;
+        mariadb)  example_uri="mariadb://localhost:3306" ;;
+    esac
+
+    if [[ -z "$uri" ]]; then
+        echo ""
+        echo "Where to restore?"
+        echo "  [1] localhost (${example_uri})"
+        echo "  [2] custom URI"
+        read -rp "Choice [1/2]: " target_choice
+        case "$target_choice" in
+            2) uri=$(prompt_uri "$db_type" "$example_uri") ;;
+            *) uri="$example_uri" ;;
+        esac
+    fi
+
+    # Ask restore mode if --drop was not specified on the command line
+    if [[ -z "$drop_mode" ]]; then
+        echo ""
+        echo "Restore mode:"
+        echo "  [1] Clean restore (--drop) — drops existing data, restores from backup (recommended)"
+        echo "  [2] Merge — only insert new documents, skip duplicates"
+        read -rp "Choice [1/2]: " restore_mode_choice
+        case "$restore_mode_choice" in
+            2) drop_mode="false" ;;
+            *) drop_mode="true" ;;
+        esac
+    fi
+
+    if [[ "$drop_mode" == "true" ]]; then
+        echo ""
+        echo "⚠  WARNING: This will DROP all existing data in the target database"
+        echo "   and replace it with the backup. This cannot be undone."
+        echo ""
+        read -rp "Type 'yes' to confirm: " confirm_drop
+        if [[ "$confirm_drop" != "yes" ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+    fi
+
+    echo ""
+    echo "[1/3] Downloading backup..."
+
+    local download_url
+    download_url=$(api_get "${BASE_URL}/api/storage/objects/${backup_object_id}/url" | jq -r '.data.url')
+
+    if [[ "$download_url" == "null" || -z "$download_url" ]]; then
+        echo "Error: Failed to get download URL."
+        exit 1
+    fi
+
+    local tmp_dir archive_path
+    tmp_dir=$(mktemp -d)
+    archive_path="${tmp_dir}/${backup_filename}"
+
+    curl -s -o "$archive_path" "$download_url"
+
+    if [[ ! -s "$archive_path" ]]; then
+        echo "Error: Download failed."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    echo "  Downloaded to ${archive_path}"
+
+    local mode_label="merge"
+    [[ "$drop_mode" == "true" ]] && mode_label="clean (--drop)"
+    echo "[2/3] Restoring to ${uri} [${mode_label}]..."
+
+    case "$db_type" in
+        mongo)               do_restore_mongo "$uri" "" "$archive_path" "$drop_mode" ;;
+        postgres)            do_restore_postgres "$uri" "" "$archive_path" "$drop_mode" ;;
+        mysql|mariadb)       "do_restore_${db_type}" "$uri" "" "$archive_path" "$drop_mode" ;;
+    esac
+
+    rm -rf "$tmp_dir"
+
+    echo "[3/3] Done."
+    echo ""
+    echo "Restore complete: ${backup_filename} -> ${uri} [${mode_label}]"
+}
+
+do_db() {
+    local subcmd="${1:-}"
+    shift || true
+    case "$subcmd" in
+        backup)  do_db_backup "$@" ;;
+        restore) do_db_restore "$@" ;;
+        *)
+            echo "Usage: kstorage db [backup|restore] ..."
+            echo "  kstorage db backup <name> --mongo --uri '...'"
+            echo "  kstorage db restore <name> --mongo"
+            exit 1 ;;
+    esac
+}
+
+# ── Auth ──────────────────────────────────────────────────────────
+
+do_auth() {
+    save_key "$1"
+}
+
+do_show_key() {
+    load_key
+    echo "$API_KEY"
+}
+
+# ── Upload ────────────────────────────────────────────────────────
+
+do_upload() {
+    local visibility="private" args=()
+
+    for arg in "$@"; do
+        case "$arg" in
+            --public) visibility="public" ;;
+            *) args+=("$arg") ;;
+        esac
+    done
+
+    local filepath="${args[0]:-}"
+    local filename="${args[1]:-$(basename "$filepath")}"
+
+    [[ -z "$filepath" || ! -f "$filepath" ]] && { echo "Error: File not found: ${filepath:-<none>}"; exit 1; }
+
+    load_key
+
+    local existing_id
+    existing_id=$(find_existing "$filename" 2>/dev/null || true)
+
+    if [[ -n "$existing_id" ]]; then
+        echo "File '${filename}' already exists (id: ${existing_id})."
+        read -rp "  [o]verwrite / [r]ename / [c]ancel? " choice
+        case "$choice" in
+            o|O)
+                echo "Deleting old file..."
+                api_delete "${BASE_URL}/api/storage/objects/${existing_id}" > /dev/null
+                ;;
+            r|R)
+                local base ext counter new_name
+                base=$(get_filename_without_ext "$filename")
+                ext=$(get_extension "$filename")
+                counter=1
+                while true; do
+                    new_name="${base}_${counter}${ext}"
+                    existing_id=$(find_existing "$new_name" 2>/dev/null || true)
+                    [[ -z "$existing_id" ]] && break
+                    counter=$((counter + 1))
+                done
+                filename="$new_name"
+                echo "Renaming to: ${filename}"
+                ;;
+            *)
+                echo "Cancelled."
+                exit 0
+                ;;
+        esac
+    fi
+
+    local size content_type
+    size=$(stat -c%s "$filepath")
+    content_type=$(file -b --mime-type "$filepath")
+
+    echo "Requesting upload token (${visibility})..."
+
+    local token_resp upload_url object_id object_key
+    token_resp=$(api_post "${BASE_URL}/api/storage/upload-token" \
+        "{\"filename\":\"${filename}\",\"contentType\":\"${content_type}\",\"size\":${size},\"visibility\":\"${visibility}\"}")
+
+    upload_url=$(echo "$token_resp" | jq -r '.data.uploadUrl')
+    object_id=$(echo "$token_resp" | jq -r '.data.objectId')
+    object_key=$(echo "$token_resp" | jq -r '.data.key')
+
+    if [[ "$upload_url" == "null" || -z "$upload_url" ]]; then
+        echo "Error: Failed to get upload token"
+        echo "$token_resp" | jq . 2>/dev/null || echo "$token_resp"
+        exit 1
+    fi
+
+    echo "Uploading ${filename} (${size} bytes)..."
+
+    local upload_resp http_code
+    upload_resp=$(curl -s -w "\n%{http_code}" -X PUT "$upload_url" \
+        -H "Content-Type: ${content_type}" \
+        --data-binary @"${filepath}")
+    http_code=$(echo "$upload_resp" | tail -1)
+    upload_resp=$(echo "$upload_resp" | sed '$d')
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        echo "Confirming upload..."
+        local confirm_resp confirm_success
+        confirm_resp=$(api_post "${BASE_URL}/api/storage/complete" "{\"objectId\":\"${object_id}\"}")
+        confirm_success=$(echo "$confirm_resp" | jq -r '.success')
+        if [[ "$confirm_success" == "true" ]]; then
+            echo "Upload complete."
+            echo "  filename: ${filename}"
+            echo "  objectId: ${object_id}"
+            if [[ "$visibility" == "public" ]]; then
+                echo "  link: https://kconsole-storage.koompi.cloud/${object_key}"
+            else
+                echo "  (private) get link with: kstorage url ${filename}"
+            fi
+        else
+            echo "Warning: Upload may not be confirmed."
+            echo "$confirm_resp" | jq . 2>/dev/null || echo "$confirm_resp"
+        fi
+    else
+        echo "Error: Upload failed (HTTP ${http_code})"
+        echo "$upload_resp" | jq . 2>/dev/null || echo "$upload_resp"
+        exit 1
+    fi
+}
+
+# ── List ──────────────────────────────────────────────────────────
+
+do_list() {
+    load_key
+
+    local fetch_all=false filter_vis="" filter_regex="" filter_ext="" output_json=false search_query=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)     fetch_all=true; shift ;;
+            --public)  filter_vis="public"; shift ;;
+            --private) filter_vis="private"; shift ;;
+            --match)   filter_regex="$2"; shift 2 ;;
+            --ext)     filter_ext="$2"; shift 2 ;;
+            --json)    output_json=true; shift ;;
+            -*)        echo "Unknown option: $1"; exit 1 ;;
+            *)         search_query="$1"; shift ;;
+        esac
+    done
+
+    local url="${BASE_URL}/api/storage/objects?limit=100"
+    [[ -n "$search_query" ]] && url="${url}&search=${search_query}"
+    [[ -n "$filter_vis" ]] && url="${url}&visibility=${filter_vis}"
+
+    local resp
+    resp=$(api_get "$url")
+
+    if $fetch_all; then
+        local pages page page_url page_resp field_name
+        pages=$(echo "$resp" | jq -r '.data.totalPages // 1')
+        # Detect which field the API uses
+        if echo "$resp" | jq -e '.data.objects' > /dev/null 2>&1; then
+            field_name="objects"
+        else
+            field_name="docs"
+        fi
+        page=2
+        while [[ "$page" -le "$pages" ]]; do
+            page_url="${url}&page=${page}"
+            page_resp=$(api_get "$page_url")
+            resp=$(echo "$resp" | jq --argjson page_data "$(echo "$page_resp" | jq ".data.${field_name} // []" )" \
+                ".data.${field_name} = (.data.${field_name} // []) + \$page_data")
+            page=$((page + 1))
+        done
+    fi
+
+    if $output_json; then
+        echo "$resp" | jq '.'
+        return
+    fi
+
+    local jq_filter="."
+    [[ -n "$filter_vis" ]] && jq_filter="${jq_filter} | select(.visibility == \"${filter_vis}\")"
+    [[ -n "$filter_regex" ]] && jq_filter="${jq_filter} | select(.filename | test(\"${filter_regex}\"))"
+    if [[ -n "$filter_ext" ]]; then
+        jq_filter="${jq_filter} | select(.filename | test(\"\\\\.${filter_ext}$\"))"
+    fi
+
+    local count
+    count=$(echo "$resp" | jq -r "[.data.objects // .data.docs // [] | .[] | ${jq_filter}] | length")
+    if [[ "$count" == "0" ]]; then
+        echo "No objects found."
+        return
+    fi
+
+    echo "$resp" | jq -r "
+        [.data.objects // .data.docs // [] | .[] | ${jq_filter}] |
+        sort_by(.createdAt) |
+        .[] |
+        \"\(.filename)  \(.size // \"?\")B  \(.visibility)  \(._id // .id // \"?\")\"
+    "
+
+    echo "--- Showing ${count} / $(echo "$resp" | jq -r '.data.total // "?"')"
+}
+
+# ── URL / Delete ─────────────────────────────────────────────────
+
+do_url() {
+    load_key
+    local object_id
+    object_id=$(resolve_name_or_id "$1")
+    api_get "${BASE_URL}/api/storage/objects/${object_id}/url" | jq -r '.data.url'
+}
+
+do_delete() {
+    load_key
+    local object_id
+    object_id=$(resolve_name_or_id "$1")
+    echo "Deleting $(basename "$1")..."
+    api_delete "${BASE_URL}/api/storage/objects/${object_id}" | jq .
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+    auth)     do_auth "$@" ;;
+    upload)   do_upload "$@" ;;
+    list)     do_list "$@" ;;
+    db)       do_db "$@" ;;
+    url)      do_url "$@" ;;
+    delete)   do_delete "$@" ;;
+    show-key) do_show_key ;;
+    *)        usage ;;
+esac
