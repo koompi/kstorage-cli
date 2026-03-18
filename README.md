@@ -1,15 +1,29 @@
-# kstorage
+# KStorage CLI
 
 CLI tool for managing files on KConsole Object Storage. Upload, download, list, delete files, and automate database backups directly to cloud storage.
 
-## Setup
+## Installation
+
+Install `kstorage` to `/usr/local/bin` using this one-liner:
 
 ```bash
-# Make it executable
-chmod +x kstorage
+curl -fsSL https://raw.githubusercontent.com/koompi/kstorage-cli/master/install.sh | bash
+```
 
-# Save your API key (stored in ~/.config/kstorage/config, file permission 600)
-./kstorage auth sk_your_bucket_api_key_here
+Alternatively, download manually and make it executable:
+
+```bash
+chmod +x kstorage
+# Move it to your PATH
+sudo mv kstorage /usr/local/bin/kstorage
+```
+
+## Setup
+
+Save your API key (stored in `~/.config/kstorage/config`, file permission `600`):
+
+```bash
+kstorage auth sk_your_bucket_api_key_here
 ```
 
 ## Dependencies
@@ -42,8 +56,8 @@ Missing tools are detected automatically before running any command, with instal
 Save the bucket API key so you don't have to pass it every time. Key is stored at `~/.config/kstorage/config`.
 
 ```bash
-./kstorage auth sk_your_key_here
-./kstorage show-key    # print current saved key
+kstorage auth sk_your_key_here
+kstorage show-key    # print current saved key
 ```
 
 ---
@@ -54,14 +68,14 @@ Upload any file to storage. Default is private; use `--public` for public CDN ac
 
 ```bash
 # Upload as private (default)
-./kstorage upload ./photo.png
+kstorage upload ./photo.png
 
 # Upload as public (CDN link returned)
-./kstorage upload --public ./photo.png
+kstorage upload --public ./photo.png
 
 # Custom filename
-./kstorage upload ./local-file.txt "remote-name.txt"
-./kstorage upload --public ./photo.png "banner.png"
+kstorage upload ./local-file.txt "remote-name.txt"
+kstorage upload --public ./photo.png "banner.png"
 ```
 
 **Duplicate handling**: If a file with the same name already exists on storage, you'll be prompted:
@@ -83,32 +97,32 @@ List all objects in the bucket with filtering and search.
 
 ```bash
 # Default: first 100 items
-./kstorage list
+kstorage list
 
 # Fetch ALL pages
-./kstorage list --all
+kstorage list --all
 
 # Server-side search
-./kstorage list "screenshot"
+kstorage list "screenshot"
 
 # Filter by visibility
-./kstorage list --public
-./kstorage list --private
+kstorage list --public
+kstorage list --private
 
 # Filter by file extension
-./kstorage list --ext png
-./kstorage list --ext gz
+kstorage list --ext png
+kstorage list --ext gz
 
 # Regex match on filename
-./kstorage list --match 'photo_\d+'
-./kstorage list --match '^stadiumx'
+kstorage list --match 'photo_\d+'
+kstorage list --match '^stadiumx'
 
 # Combine filters
-./kstorage list --public --ext png --match 'banner'
-./kstorage list --all --private --match 'backup'
+kstorage list --public --ext png --match 'banner'
+kstorage list --all --private --match 'backup'
 
 # Raw JSON output
-./kstorage list --json
+kstorage list --json
 ```
 
 Output format: `filename  size  visibility  objectId`
@@ -126,8 +140,8 @@ photo.png                                2048B     public   65d123abc456def78901
 Get a temporary access URL for a private file. Accepts either a filename or objectId.
 
 ```bash
-./kstorage url stadiumx-db-2026-03-18_020000.mongo.gz
-./kstorage url 69ba86f4d0ac63b3cd48d787
+kstorage url stadiumx-db-2026-03-18_020000.mongo.gz
+kstorage url 69ba86f4d0ac63b3cd48d787
 ```
 
 Output: a pre-signed URL that expires after 10 minutes (default).
@@ -139,8 +153,8 @@ Output: a pre-signed URL that expires after 10 minutes (default).
 Delete a file by filename or objectId.
 
 ```bash
-./kstorage delete photo.png
-./kstorage delete 69ba86f4d0ac63b3cd48d787
+kstorage delete photo.png
+kstorage delete 69ba86f4d0ac63b3cd48d787
 ```
 
 ---
@@ -171,32 +185,32 @@ Delete a file by filename or objectId.
 
 ```bash
 # MongoDB
-./kstorage db backup stadiumx --mongo --uri 'mongodb://user:pass@host:27017/stadiumx'
+kstorage db backup stadiumx --mongo --uri 'mongodb://user:pass@host:27017/stadiumx'
 
 # PostgreSQL
-./kstorage db backup weteka --postgres --uri 'postgresql://user:pass@host:5432/weteka'
+kstorage db backup weteka --postgres --uri 'postgresql://user:pass@host:5432/weteka'
 
 # MySQL
-./kstorage db backup myapp --mysql --uri 'mysql://user:pass@host:3306/myapp'
+kstorage db backup myapp --mysql --uri 'mysql://user:pass@host:3306/myapp'
 
 # MariaDB
-./kstorage db backup myapp --mariadb --uri 'mariadb://user:pass@host:3306/myapp'
+kstorage db backup myapp --mariadb --uri 'mariadb://user:pass@host:3306/myapp'
 
 # Omit --uri to be prompted interactively
-./kstorage db backup stadiumx --mongo
+kstorage db backup stadiumx --mongo
 # > mongo URI (mongodb://user:pass@host:27017): █
 
 # Specify database name separately (if not in URI)
-./kstorage db backup myapp --mongo --uri 'mongodb://localhost:27017' --db myapp
+kstorage db backup myapp --mongo --uri 'mongodb://localhost:27017' --db myapp
 
 # Keep only last 3 backups (default: 7)
-./kstorage db backup stadiumx --mongo --uri '...' --keep 3
+kstorage db backup stadiumx --mongo --uri '...' --keep 3
 
 # Upload as public (default: private)
-./kstorage db backup stadiumx --mongo --uri '...' --public
+kstorage db backup stadiumx --mongo --uri '...' --public
 
 # Dry run - see what would happen without doing it
-./kstorage db backup stadiumx --mongo --uri '...' --dry-run
+kstorage db backup stadiumx --mongo --uri '...' --dry-run
 ```
 
 **Archive naming**: `<name>-db-<timestamp>.<type>.gz`
@@ -231,19 +245,19 @@ Examples:
 
 ```bash
 # Interactive - picks backup via fzf/list, then asks restore mode and target
-./kstorage db restore stadiumx --mongo
+kstorage db restore stadiumx --mongo
 
 # Clean restore (recommended) - drops existing data, restores from backup
-./kstorage db restore stadiumx --mongo --drop
+kstorage db restore stadiumx --mongo --drop
 
 # Restore to specific target (skip target prompt)
-./kstorage db restore stadiumx --mongo --uri 'mongodb://localhost:27017/stadiumx'
+kstorage db restore stadiumx --mongo --uri 'mongodb://localhost:27017/stadiumx'
 
 # Clean restore to specific target
-./kstorage db restore stadiumx --mongo --drop --uri 'mongodb://localhost:27017/stadiumx'
+kstorage db restore stadiumx --mongo --drop --uri 'mongodb://localhost:27017/stadiumx'
 
 # Restore to a remote server
-./kstorage db restore weteka --postgres --uri 'postgresql://admin:pass@prod-host:5432/weteka'
+kstorage db restore weteka --postgres --uri 'postgresql://admin:pass@prod-host:5432/weteka'
 ```
 
 **Restore modes:**
