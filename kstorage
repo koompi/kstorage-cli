@@ -954,10 +954,17 @@ do_list() {
     fi
 
     echo "$resp" | jq -r "
+        def hsize:
+          if . == null then \"?\"
+          elif . < 1024 then \"\(.)B\"
+          elif . < 1048576 then \"\(. / 1024 | . * 10 | floor | . / 10)KB\"
+          elif . < 1073741824 then \"\(. / 1048576 | . * 10 | floor | . / 10)MB\"
+          else \"\(. / 1073741824 | . * 10 | floor | . / 10)GB\"
+          end;
         [.data.objects // .data.docs // [] | .[] | ${jq_filter}] |
         sort_by(.createdAt) |
         .[] |
-        \"\(.filename)  \(.size // \"?\")B  \(.visibility)  \(._id // .id // \"?\")\"
+        \"\(.filename)  \(.size | hsize)  \(.visibility)  \(._id // .id // \"?\")\"
     "
 
     echo "--- Showing ${count} / $(echo "$resp" | jq -r '.data.total // "?"')"
