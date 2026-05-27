@@ -216,27 +216,35 @@ upload_file() {
 # ── Database helpers ──────────────────────────────────────────────
 
 do_backup_mongo() {
-    local uri="$1" db="$2" out_dir="$3"
-    local cmd=(mongodump --uri "$uri" --out "$out_dir")
+    local uri="$1" db="$2" out_file="$3"
+    local cmd=(mongodump --uri "$uri" --archive="$out_file" --gzip --numParallelCollections=4)
     [[ -n "$db" ]] && cmd+=(--db "$db")
     "${cmd[@]}" 2>&1
 }
 
 do_restore_mongo() {
     local uri="$1" db="$2" archive="$3" drop="${4:-false}"
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    tar xzf "$archive" -C "$tmp_dir"
-    # Find the actual dump directory inside the extracted archive
-    local dump_dir
-    dump_dir=$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
-    [[ -z "$dump_dir" ]] && dump_dir="$tmp_dir"
-    local cmd=(mongorestore --uri "$uri")
-    [[ "$drop" == "true" ]] && cmd+=(--drop)
-    [[ -n "$db" ]] && cmd+=(--db "$db")
-    cmd+=("$dump_dir/")
-    "${cmd[@]}" 2>&1
-    rm -rf "$tmp_dir"
+    # Autodetect format: legacy tar.gz of a mongodump --out directory, vs new
+    # mongodump --archive --gzip single-file archive. `tar tzf` succeeds only
+    # on the legacy format.
+    if tar tzf "$archive" >/dev/null 2>&1; then
+        local tmp_dir dump_dir
+        tmp_dir=$(mktemp -d)
+        tar xzf "$archive" -C "$tmp_dir"
+        dump_dir=$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
+        [[ -z "$dump_dir" ]] && dump_dir="$tmp_dir"
+        local cmd=(mongorestore --uri "$uri")
+        [[ "$drop" == "true" ]] && cmd+=(--drop)
+        [[ -n "$db" ]] && cmd+=(--db "$db")
+        cmd+=("$dump_dir/")
+        "${cmd[@]}" 2>&1
+        rm -rf "$tmp_dir"
+    else
+        local cmd=(mongorestore --uri "$uri" --archive="$archive" --gzip --numParallelCollections=4)
+        [[ "$drop" == "true" ]] && cmd+=(--drop)
+        [[ -n "$db" ]] && cmd+=(--nsInclude="${db}.*")
+        "${cmd[@]}" 2>&1
+    fi
 }
 
 do_backup_postgres() {
@@ -361,19 +369,7 @@ do_db_backup() {
     echo "[1/3] Dumping database..."
     mkdir -p "$work_dir"
 
-    case "$db_type" in
-        mongo)
-            do_backup_mongo "$uri" "$db_name" "$work_dir"
-            echo "  Compressing..."
-            tar czf "/tmp/kstorage-tmp-${timestamp}.tar.gz" -C /tmp "$(basename "$work_dir")" 2>/dev/null
-            rm -rf "$work_dir"
-            mkdir -p "$work_dir"
-            mv "/tmp/kstorage-tmp-${timestamp}.tar.gz" "${work_dir}/archive.gz"
-            ;;
-        postgres|mysql|mariadb)
-            "do_backup_${db_type}" "$uri" "$db_name" "${work_dir}/archive.gz"
-            ;;
-    esac
+    "do_backup_${db_type}" "$uri" "$db_name" "${work_dir}/archive.gz"
 
     echo "[2/3] Uploading to kstorage..."
 

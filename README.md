@@ -174,8 +174,9 @@ kstorage delete 69ba86f4d0ac63b3cd48d787
 2. Check required tools exist (mongodump/pg_dump/mysqldump, curl, jq)
 3. If --uri not provided, prompt for it interactively
 4. [1/3] Dump database using the native tool with --gzip
-5.        - Mongo: mongodump -> tar.gz archive
-6.        - Postgres/MySQL/MariaDB: dump output piped through gzip
+5.        - Mongo: mongodump --archive --gzip (single-file streaming archive,
+6.          parallel collection dump via --numParallelCollections=4)
+7.        - Postgres/MySQL/MariaDB: dump output piped through gzip
 7. [2/3] Upload compressed archive to storage
 8. [3/3] Clean up old backups beyond --keep limit (default: 7)
 9. Prompt to schedule cron job
