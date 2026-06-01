@@ -7,6 +7,11 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 
 mkdir -p "$CONFIG_DIR"
 
+# Temp passphrase file we create for gpg; removed on any exit.
+TMP_PWFILE=""
+cleanup() { [[ -n "${TMP_PWFILE:-}" ]] && rm -f "$TMP_PWFILE"; }
+trap cleanup EXIT
+
 check_tools() {
     local missing=()
     for tool in "$@"; do
@@ -29,6 +34,7 @@ check_tools() {
                 curl)            echo "  curl:         sudo apt install curl" ;;
                 jq)              echo "  jq:           sudo apt install jq" ;;
                 file)            echo "  file:         sudo apt install file" ;;
+                gpg)             echo "  gpg:          sudo apt install gnupg" ;;
                 fzf)             echo "  fzf:          sudo apt install fzf (optional)" ;;
                 *)               echo "  ${tool}:       (check your package manager)" ;;
             esac
@@ -65,7 +71,13 @@ DB backup:
     --db <database>              Database name (if not in URI)
     --keep <N>                   Keep last N backups (default: 7)
     --public                     Upload as public (default: private)
+    --encrypt                    Encrypt with a password (AES-256) before upload
+    --password <pw>              Encryption password (visible in ps; prefer the file form)
+    --password-file <path>       Read encryption password from a file (best for cron)
     --dry-run                    Show what would happen
+
+  Encrypted backups end in .gpg and can be decrypted by hand with:
+    gpg -d -o backup.gz backup.gz.gpg
 
 DB restore:
   kstorage db restore stadiumx --mongo
@@ -75,6 +87,8 @@ DB restore:
   Options:
     --drop                       Drop existing data before restoring (clean restore)
     --uri <connection-uri>       Target connection string (prompted if omitted)
+    --password <pw>              Decryption password for encrypted (.gpg) backups
+    --password-file <path>       Read decryption password from a file
 
 List options:
   --all                       Fetch all pages (default: first 100)
@@ -85,6 +99,7 @@ List options:
 
 Environment:
   KSTORAGE_BASE_URL           Override API base URL
+  KSTORAGE_BACKUP_PASSWORD    Encryption/decryption password (alternative to --password)
 EOF
     exit 1
 }
@@ -169,12 +184,76 @@ get_db_ext() {
     esac
 }
 
+# ── Encryption ────────────────────────────────────────────────────
+#
+# Backups are encrypted client-side with gpg symmetric AES-256 *before*
+# upload, so a plaintext database dump never leaves this machine. The file
+# plus the password is all anyone needs to decrypt — with kstorage, or by
+# hand:  gpg -d -o backup.gz backup.gz.gpg
+
+# Resolve the encryption password into a file gpg can read and set
+# PWFILE_PATH to its location. Sources, in priority order:
+#   --password-file <path>  >  KSTORAGE_BACKUP_PASSWORD env  >  --password <pw>  >  prompt
+# A temp file we create is tracked in TMP_PWFILE and removed on exit.
+# $1 = "backup" (confirm twice) or "restore" (single prompt)
+resolve_passphrase_file() {
+    local mode="$1" pw="" pw2 tmp
+
+    if [[ -n "${PASSWORD_FILE:-}" ]]; then
+        [[ -f "$PASSWORD_FILE" ]] || { echo "Error: password file not found: ${PASSWORD_FILE}" >&2; exit 1; }
+        PWFILE_PATH="$PASSWORD_FILE"
+        return
+    fi
+
+    if [[ -n "${KSTORAGE_BACKUP_PASSWORD:-}" ]]; then
+        pw="$KSTORAGE_BACKUP_PASSWORD"
+    elif [[ -n "${PASSWORD_ARG:-}" ]]; then
+        pw="$PASSWORD_ARG"
+    elif [[ -t 0 ]]; then
+        read -rsp "Encryption password: " pw; echo >&2
+        if [[ "$mode" == "backup" ]]; then
+            read -rsp "Confirm password: " pw2; echo >&2
+            [[ "$pw" == "$pw2" ]] || { echo "Error: passwords do not match." >&2; exit 1; }
+        fi
+    else
+        echo "Error: encryption password required but no TTY." >&2
+        echo "       Use --password-file <path>, --password <pw>, or set KSTORAGE_BACKUP_PASSWORD." >&2
+        exit 1
+    fi
+
+    [[ -n "$pw" ]] || { echo "Error: empty encryption password." >&2; exit 1; }
+
+    tmp=$(mktemp)
+    chmod 600 "$tmp"
+    printf '%s' "$pw" > "$tmp"
+    TMP_PWFILE="$tmp"
+    PWFILE_PATH="$tmp"
+}
+
+encrypt_file() {
+    # $1=plaintext in, $2=ciphertext out, $3=passphrase file
+    gpg --batch --yes --pinentry-mode loopback --no-symkey-cache \
+        --passphrase-file "$3" \
+        --symmetric --cipher-algo AES256 \
+        --output "$2" "$1"
+}
+
+decrypt_file() {
+    # $1=ciphertext in, $2=plaintext out, $3=passphrase file
+    gpg --batch --yes --pinentry-mode loopback --no-symkey-cache \
+        --passphrase-file "$3" \
+        --decrypt --output "$2" "$1"
+}
+
 upload_file() {
     local filepath="$1" filename="$2" visibility="$3"
     local size content_type token_resp upload_url object_id
 
     size=$(stat -c%s "$filepath")
-    content_type="application/gzip"
+    case "$filename" in
+        *.gpg) content_type="application/octet-stream" ;;
+        *)     content_type="application/gzip" ;;
+    esac
 
     token_resp=$(api_post "${BASE_URL}/api/storage/upload-token" \
         "{\"filename\":\"${filename}\",\"contentType\":\"${content_type}\",\"size\":${size},\"visibility\":\"${visibility}\"}")
@@ -301,20 +380,24 @@ do_restore_mariadb() {
 
 do_db_backup() {
     local db_type="" name="" uri="" db_name="" keep=7 visibility="private" dry_run=false
+    local encrypt=false PASSWORD_ARG="" PASSWORD_FILE="" PWFILE_PATH=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --mongo)    db_type="mongo"; shift ;;
-            --postgres) db_type="postgres"; shift ;;
-            --mysql)    db_type="mysql"; shift ;;
-            --mariadb)  db_type="mariadb"; shift ;;
-            --uri)      uri="$2"; shift 2 ;;
-            --db)       db_name="$2"; shift 2 ;;
-            --keep)     keep="$2"; shift 2 ;;
-            --public)   visibility="public"; shift ;;
-            --dry-run)  dry_run=true; shift ;;
-            -*)         echo "Unknown option: $1"; exit 1 ;;
-            *)          name="$1"; shift ;;
+            --mongo)         db_type="mongo"; shift ;;
+            --postgres)      db_type="postgres"; shift ;;
+            --mysql)         db_type="mysql"; shift ;;
+            --mariadb)       db_type="mariadb"; shift ;;
+            --uri)           uri="$2"; shift 2 ;;
+            --db)            db_name="$2"; shift 2 ;;
+            --keep)          keep="$2"; shift 2 ;;
+            --public)        visibility="public"; shift ;;
+            --dry-run)       dry_run=true; shift ;;
+            --encrypt)       encrypt=true; shift ;;
+            --password)      PASSWORD_ARG="$2"; encrypt=true; shift 2 ;;
+            --password-file) PASSWORD_FILE="$2"; encrypt=true; shift 2 ;;
+            -*)              echo "Unknown option: $1"; exit 1 ;;
+            *)               name="$1"; shift ;;
         esac
     done
 
@@ -326,6 +409,7 @@ do_db_backup() {
         postgres)      required_tools+=(pg_dump) ;;
         mysql|mariadb) required_tools+=(mysqldump) ;;
     esac
+    $encrypt && required_tools+=(gpg)
     check_tools "${required_tools[@]}"
 
     [[ -z "$name" ]] && { echo "Error: Backup name is required."; exit 1; }
@@ -352,12 +436,14 @@ do_db_backup() {
     timestamp=$(date +%Y-%m-%d_%H%M%S)
     ext=$(get_db_ext "$db_type")
     archive_name="${name}-db-${timestamp}.${ext}"
+    $encrypt && archive_name="${archive_name}.gpg"
     work_dir="/tmp/kstorage-backup-${name}-${timestamp}"
 
     echo "=== DB Backup: ${name} (${db_type}) ==="
     echo "  archive:    ${archive_name}"
     echo "  keep:       last ${keep}"
     echo "  visibility: ${visibility}"
+    $encrypt && echo "  encryption: AES-256 (password)"
 
     if $dry_run; then
         echo ""
@@ -365,16 +451,36 @@ do_db_backup() {
         return
     fi
 
+    # Resolve the password before dumping so a bad/missing password fails fast.
+    if $encrypt; then
+        resolve_passphrase_file backup
+    fi
+
+    local total=3 step=1
+    $encrypt && total=4
+
     echo ""
-    echo "[1/3] Dumping database..."
+    echo "[${step}/${total}] Dumping database..."; step=$((step + 1))
     mkdir -p "$work_dir"
 
     "do_backup_${db_type}" "$uri" "$db_name" "${work_dir}/archive.gz"
 
-    echo "[2/3] Uploading to kstorage..."
+    local upload_path="${work_dir}/archive.gz"
+    if $encrypt; then
+        echo "[${step}/${total}] Encrypting backup (AES-256)..."; step=$((step + 1))
+        if ! encrypt_file "${work_dir}/archive.gz" "${work_dir}/archive.gz.gpg" "$PWFILE_PATH"; then
+            echo "Error: encryption failed."
+            rm -rf "$work_dir"
+            exit 1
+        fi
+        rm -f "${work_dir}/archive.gz"
+        upload_path="${work_dir}/archive.gz.gpg"
+    fi
+
+    echo "[${step}/${total}] Uploading to kstorage..."; step=$((step + 1))
 
     local object_id upload_ok
-    object_id=$(upload_file "${work_dir}/archive.gz" "$archive_name" "$visibility") || upload_ok=$?
+    object_id=$(upload_file "$upload_path" "$archive_name" "$visibility") || upload_ok=$?
     rm -rf "$work_dir"
 
     if [[ "${upload_ok:-0}" -ne 0 ]]; then
@@ -382,14 +488,14 @@ do_db_backup() {
         exit 1
     fi
 
-    echo "[3/3] Cleaning up old backups (keeping last ${keep})..."
+    echo "[${step}/${total}] Cleaning up old backups (keeping last ${keep})..."
 
     local all_backups backup_ids bname bid
     all_backups=$(api_get "${BASE_URL}/api/storage/objects?search=${name}-db-&limit=100")
     backup_ids=$(echo "$all_backups" | jq -r "
         [.data.objects // .data.docs // [] |
         .[] |
-        select(.filename | test(\"^${name}-db-.*\\\\.${ext}$\"))] |
+        select(.filename | test(\"^${name}-db-.*\\\\.${ext}(\\\\.gpg)?$\"))] |
         sort_by(.createdAt) |
         .[:-${keep}] |
         .[]._id // .id // empty
@@ -509,11 +615,26 @@ do_db_backup() {
     echo ""
     echo "Schedule: ${schedule_label} (${cron_expr})"
 
-    local script_path cron_cmd
+    local script_path cron_cmd cron_passfile=""
     script_path=$(readlink -f "$0")
     cron_cmd="${cron_expr} PATH=/usr/local/bin:/usr/bin:/bin ${script_path} db backup ${name} --${db_type} --uri '${uri}'"
     [[ -n "$db_name" ]] && cron_cmd="${cron_cmd} --db '${db_name}'"
     cron_cmd="${cron_cmd} --keep ${keep}"
+
+    if $encrypt; then
+        # Unattended runs can't prompt, so the password lives in a file. Reuse
+        # the user's --password-file if given; otherwise persist it (chmod 600).
+        if [[ -n "${PASSWORD_FILE:-}" ]]; then
+            cron_passfile="$PASSWORD_FILE"
+        else
+            cron_passfile="${CONFIG_DIR}/backup-${name}.pass"
+            cp "$PWFILE_PATH" "$cron_passfile"
+            chmod 600 "$cron_passfile"
+            echo ""
+            echo "  Note: backup password saved to ${cron_passfile} (chmod 600) so cron can run unattended."
+        fi
+        cron_cmd="${cron_cmd} --encrypt --password-file '${cron_passfile}'"
+    fi
 
     echo ""
     echo "Cron job to add:"
@@ -566,6 +687,7 @@ do_db_backup() {
             local test_cmd="${script_path} db backup ${name} --${db_type} --uri '${uri}'"
             [[ -n "$db_name" ]] && test_cmd="${test_cmd} --db '${db_name}'"
             test_cmd="${test_cmd} --keep ${keep}"
+            $encrypt && test_cmd="${test_cmd} --encrypt --password-file '${cron_passfile}'"
             # Run with stdin from /dev/null to simulate cron (no TTY)
             if eval "$test_cmd" < /dev/null; then
                 echo ""
@@ -587,17 +709,20 @@ do_db_backup() {
 
 do_db_restore() {
     local db_type="" name="" uri="" drop_mode=""
+    local PASSWORD_ARG="" PASSWORD_FILE="" PWFILE_PATH=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --mongo)    db_type="mongo"; shift ;;
-            --postgres) db_type="postgres"; shift ;;
-            --mysql)    db_type="mysql"; shift ;;
-            --mariadb)  db_type="mariadb"; shift ;;
-            --uri)      uri="$2"; shift 2 ;;
-            --drop)     drop_mode="true"; shift ;;
-            -*)         echo "Unknown option: $1"; exit 1 ;;
-            *)          name="$1"; shift ;;
+            --mongo)         db_type="mongo"; shift ;;
+            --postgres)      db_type="postgres"; shift ;;
+            --mysql)         db_type="mysql"; shift ;;
+            --mariadb)       db_type="mariadb"; shift ;;
+            --uri)           uri="$2"; shift 2 ;;
+            --drop)          drop_mode="true"; shift ;;
+            --password)      PASSWORD_ARG="$2"; shift 2 ;;
+            --password-file) PASSWORD_FILE="$2"; shift 2 ;;
+            -*)              echo "Unknown option: $1"; exit 1 ;;
+            *)               name="$1"; shift ;;
         esac
     done
 
@@ -627,7 +752,7 @@ do_db_restore() {
     backups_json=$(echo "$all_backups" | jq -r "
         [.data.objects // .data.docs // [] |
         .[] |
-        select(.filename | test(\"^${name}-db-.*\\\\.${ext}$\"))] |
+        select(.filename | test(\"^${name}-db-.*\\\\.${ext}(\\\\.gpg)?$\"))] |
         sort_by(.createdAt) |
         reverse |
         .[] |
@@ -736,6 +861,20 @@ do_db_restore() {
     fi
 
     echo "  Downloaded to ${archive_path}"
+
+    if [[ "$backup_filename" == *.gpg ]]; then
+        check_tools gpg
+        echo "  Backup is encrypted — decrypting..."
+        resolve_passphrase_file restore
+        local plain_path="${archive_path%.gpg}"
+        if ! decrypt_file "$archive_path" "$plain_path" "$PWFILE_PATH"; then
+            echo "Error: decryption failed (wrong password?)."
+            rm -rf "$tmp_dir"
+            exit 1
+        fi
+        rm -f "$archive_path"
+        archive_path="$plain_path"
+    fi
 
     local mode_label="merge"
     [[ "$drop_mode" == "true" ]] && mode_label="clean (--drop)"

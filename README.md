@@ -43,6 +43,7 @@ Optional:
 | `mongodump` / `mongorestore` | `sudo apt install mongodb-database-tools` | `db backup/restore --mongo` |
 | `pg_dump` / `psql` | `sudo apt install postgresql-client` | `db backup/restore --postgres` |
 | `mysqldump` / `mysql` | `sudo apt install mysql-client` | `db backup/restore --mysql` |
+| `gpg` | `sudo apt install gnupg` | Encrypted backups (`db backup --encrypt`) |
 | `fzf` | `sudo apt install fzf` | Interactive restore picker (optional, falls back to numbered list) |
 
 Missing tools are detected automatically before running any command, with install instructions shown for each missing tool.
@@ -173,13 +174,14 @@ kstorage delete 69ba86f4d0ac63b3cd48d787
 1. Validate arguments (--mongo/--postgres/--mysql/--mariadb, name, --uri)
 2. Check required tools exist (mongodump/pg_dump/mysqldump, curl, jq)
 3. If --uri not provided, prompt for it interactively
-4. [1/3] Dump database using the native tool with --gzip
+4. Dump database using the native tool with --gzip
 5.        - Mongo: mongodump --archive --gzip (single-file streaming archive,
 6.          parallel collection dump via --numParallelCollections=4)
 7.        - Postgres/MySQL/MariaDB: dump output piped through gzip
-7. [2/3] Upload compressed archive to storage
-8. [3/3] Clean up old backups beyond --keep limit (default: 7)
-9. Prompt to schedule cron job
+8. (optional) Encrypt the archive with gpg AES-256 if --encrypt is set
+9. Upload the (compressed, maybe encrypted) archive to storage
+10. Clean up old backups beyond --keep limit (default: 7)
+11. Prompt to schedule cron job
 ```
 
 ### Usage
@@ -214,13 +216,69 @@ kstorage db backup stadiumx --mongo --uri '...' --public
 kstorage db backup stadiumx --mongo --uri '...' --dry-run
 ```
 
-**Archive naming**: `<name>-db-<timestamp>.<type>.gz`
+**Archive naming**: `<name>-db-<timestamp>.<type>.gz` (encrypted backups add `.gpg`)
 
 Examples:
 - `stadiumx-db-2026-03-18_020000.mongo.gz`
 - `weteka-db-2026-03-18_020000.postgres.gz`
 - `myapp-db-2026-03-18_020000.mysql.gz`
 - `myapp-db-2026-03-18_020000.mariadb.gz`
+- `stadiumx-db-2026-03-18_020000.mongo.gz.gpg` _(encrypted)_
+
+---
+
+### Encryption (optional)
+
+> **Opt-in and backwards compatible.** Encryption is off unless you pass the new
+> `--encrypt` / `--password` / `--password-file` argument. **Existing backups and
+> cron jobs that don't use these flags keep working exactly as before** — they
+> still produce plain `.gz` archives. Restore transparently handles both: old
+> unencrypted `.gz` backups and new encrypted `.gz.gpg` backups show up in the
+> same picker, and only `.gpg` files trigger a password prompt.
+
+By default, backups are uploaded compressed but **unencrypted** — the plaintext
+dump lives in cloud storage as-is. Add `--encrypt` to encrypt the archive
+client-side with **gpg symmetric AES-256** _before_ it leaves the machine, so
+storage (and anyone holding the API key) only ever sees ciphertext.
+
+The password is all that's needed to decrypt. There's no keypair to manage, and
+the file is portable — you can hand someone the `.gpg` file plus the password
+and they can open it with plain `gpg`, with or without kstorage.
+
+```bash
+# Prompt for a password interactively (asks twice to confirm)
+kstorage db backup stadiumx --mongo --uri '...' --encrypt
+
+# Pass the password directly (note: visible in `ps` — prefer the file form)
+kstorage db backup stadiumx --mongo --uri '...' --password 'my-secret'
+
+# Read the password from a file (best for scripts and cron)
+kstorage db backup stadiumx --mongo --uri '...' --password-file ~/.kstorage.pass
+
+# Or via environment variable
+KSTORAGE_BACKUP_PASSWORD='my-secret' kstorage db backup stadiumx --mongo --uri '...' --encrypt
+```
+
+**Password sources**, in priority order: `--password-file` → `KSTORAGE_BACKUP_PASSWORD`
+env → `--password` → interactive prompt.
+
+Restore auto-detects encrypted (`.gpg`) backups and asks for the password (or
+takes it from `--password` / `--password-file` / the env var):
+
+```bash
+kstorage db restore stadiumx --mongo --drop --password-file ~/.kstorage.pass
+```
+
+**Decrypt by hand** (no kstorage needed):
+
+```bash
+gpg -d -o backup.mongo.gz stadiumx-db-2026-03-18_020000.mongo.gz.gpg
+# then restore the .gz with mongorestore/psql/mysql as usual
+```
+
+> ⚠️ **Key custody**: lose the password and the backup is unrecoverable — that's
+> the whole point. Store it somewhere safe and separate from the backups, and
+> verify you can decrypt a backup before relying on it.
 
 ---
 
@@ -334,6 +392,8 @@ Install as sudo user? [y/N]:
 
 **Important**: The cron job saves your `--uri` (including credentials) in plain text in the crontab. Make sure the crontab file permissions are restrictive. For the `/etc/cron.d/` file, permissions are set to `644` (readable by all, writable by root). For user crontab, it's managed by the system.
 
+**Encrypted backups in cron**: if you used `--encrypt`, the cron job needs the password without a prompt. kstorage saves it to `~/.config/kstorage/backup-<name>.pass` (`chmod 600`) and references it via `--password-file` in the cron line — the password itself is never written into the crontab. Provide your own file with `--password-file` to reuse an existing one.
+
 **Removing a cron job**:
 ```bash
 # System-wide cron
@@ -350,12 +410,14 @@ crontab -e
 | File | Description |
 |------|-------------|
 | `~/.config/kstorage/config` | Saved API key (`key=sk_...`) |
+| `~/.config/kstorage/backup-<name>.pass` | Saved backup password for encrypted cron jobs (`chmod 600`) |
 | `/etc/cron.d/kstorage-backup-<name>` | System-wide cron jobs |
 | User crontab | User-level cron jobs (tagged with `# kstorage:<name>`) |
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | `KSTORAGE_BASE_URL` | Override API base URL | `https://api-kconsole.koompi.cloud` |
+| `KSTORAGE_BACKUP_PASSWORD` | Encryption/decryption password for `db backup --encrypt` / `db restore` | _(none)_ |
 
 ---
 
