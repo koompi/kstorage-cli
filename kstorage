@@ -8,8 +8,10 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 mkdir -p "$CONFIG_DIR"
 
 # Temp passphrase file we create for gpg; removed on any exit.
+# Preserve the script's real exit code — a bare `[[ ... ]] && rm` would leak
+# its own (failing) status as the script's exit code when TMP_PWFILE is empty.
 TMP_PWFILE=""
-cleanup() { [[ -n "${TMP_PWFILE:-}" ]] && rm -f "$TMP_PWFILE"; }
+cleanup() { local rc=$?; [[ -n "${TMP_PWFILE:-}" ]] && rm -f "$TMP_PWFILE"; return $rc; }
 trap cleanup EXIT
 
 check_tools() {
